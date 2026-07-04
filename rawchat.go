@@ -123,6 +123,12 @@ func (c *rawCardChat) Run() error {
 	sideImage := ""
 	sidePrompt := ""
 
+	// Scene-image auto-illustration: every 3 character rounds the AI paints the
+	// current scene beside the avatar. Toggle with /autoimage.
+	roundCount := 0
+	autoImage := true
+	isMock := provider == ProviderMock || provider == ""
+
 	// Layout, recomputed on resize.
 	var cols, rows, avH, avW, convTop, convBottom, barRow, inputRow int
 	layout := func() {
@@ -337,7 +343,29 @@ func (c *rawCardChat) Run() error {
 		}()
 	}
 
-	// generateImage fires image generation in the background.
+	// saveImageData persists a GenerateImage result (URL or base64) to a local
+	// file and returns the path.
+	saveImageData := func(ctx context.Context, data string) (string, error) {
+		dir := filepath.Join(Paths.DataDir, "images")
+		os.MkdirAll(dir, 0755)
+		path := filepath.Join(dir, fmt.Sprintf("img-%d.jpg", time.Now().UnixNano()))
+		if strings.HasPrefix(data, "http") {
+			if err := downloadImage(ctx, data, path); err != nil {
+				return "", err
+			}
+		} else {
+			raw, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return "", err
+			}
+			if err := os.WriteFile(path, raw, 0644); err != nil {
+				return "", err
+			}
+		}
+		return path, nil
+	}
+
+	// generateImage fires image generation from an explicit prompt in the background.
 	generateImage := func(prompt string) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -347,23 +375,62 @@ func (c *rawCardChat) Run() error {
 				events <- chatEvent{kind: "error", msg: Message{Content: "image generation failed: " + err.Error()}}
 				return
 			}
-			dir := filepath.Join(Paths.DataDir, "images")
-			os.MkdirAll(dir, 0755)
-			path := filepath.Join(dir, fmt.Sprintf("img-%d.jpg", time.Now().Unix()))
-			if strings.HasPrefix(data, "http") {
-				if err := downloadImage(ctx, data, path); err != nil {
-					events <- chatEvent{kind: "error", msg: Message{Content: "image download failed: " + err.Error()}}
-					return
-				}
-			} else {
-				raw, derr := base64.StdEncoding.DecodeString(data)
-				if derr != nil {
-					events <- chatEvent{kind: "error", msg: Message{Content: "decode image: " + derr.Error()}}
-					return
-				}
-				os.WriteFile(path, raw, 0644)
+			path, err := saveImageData(ctx, data)
+			if err != nil {
+				events <- chatEvent{kind: "error", msg: Message{Content: "save image: " + err.Error()}}
+				return
 			}
 			events <- chatEvent{kind: "image", imgPath: path, imgPrompt: prompt}
+		}()
+	}
+
+	// generateSceneImage asks the LLM to distill the last few messages into a
+	// vivid image prompt, then generates a picture of the current scene — this is
+	// how the character illustrates the story (via /image with no prompt, and
+	// automatically every few rounds).
+	generateSceneImage := func() {
+		snapshot := make([]Message, len(messages))
+		copy(snapshot, messages)
+		go func() {
+			// Collect the last 3 conversational lines.
+			var recent []Message
+			for i := len(snapshot) - 1; i >= 0 && len(recent) < 3; i-- {
+				switch snapshot[i].Type {
+				case MessageTypeSystem, MessageTypeCommand, MessageTypeSummary:
+					continue
+				}
+				recent = append([]Message{snapshot[i]}, recent...)
+			}
+			var b strings.Builder
+			b.WriteString("You are an art director. From the recent roleplay lines below, write ONE vivid image-generation prompt depicting the CURRENT scene — setting, characters, action, mood, lighting, and art style. Output ONLY the prompt on a single line, no preamble, no quotes.\n\n")
+			for _, mm := range recent {
+				b.WriteString(mm.Sender + ": " + mm.Content + "\n")
+			}
+			sctx, scancel := context.WithTimeout(context.Background(), 60*time.Second)
+			scenePrompt, err := llmSvc.GenerateResponse(sctx, b.String(), LLMModel(model), apiCfg)
+			scancel()
+			if err != nil {
+				events <- chatEvent{kind: "error", msg: Message{Content: "scene summary failed: " + err.Error()}}
+				return
+			}
+			scenePrompt = strings.Trim(strings.TrimSpace(scenePrompt), "\"'`")
+			if scenePrompt == "" {
+				events <- chatEvent{kind: "error", msg: Message{Content: "scene summary was empty"}}
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			data, err := imgSvc.GenerateImage(ctx, scenePrompt, ImageModel(imgModel))
+			if err != nil {
+				events <- chatEvent{kind: "error", msg: Message{Content: "scene image failed: " + err.Error()}}
+				return
+			}
+			path, err := saveImageData(ctx, data)
+			if err != nil {
+				events <- chatEvent{kind: "error", msg: Message{Content: "save image: " + err.Error()}}
+				return
+			}
+			events <- chatEvent{kind: "image", imgPath: path, imgPrompt: "🎬 " + scenePrompt}
 		}()
 	}
 
@@ -374,8 +441,10 @@ func (c *rawCardChat) Run() error {
 			c.action = "back"
 			return true
 		case "help":
-			pushSys("Commands: /image <prompt> · /memory · /commit <fact> · /compact · /prompt <text> · " +
-				"/save · /export · /models · /exit   |   Shortcuts: ^G image  ^O memory  ^K compact  ^E export  ^S save  ^X exit  ·  ↑/↓ or PgUp/PgDn scroll")
+			pushSys("Commands: /image <prompt> (blank = illustrate current scene) · /autoimage on|off · " +
+				"/memory · /commit <fact> · /compact · /prompt <text> · /save · /export · /models · /exit\n" +
+				"Shortcuts: ^G image  ^O memory  ^K compact  ^E export  ^S save  ^X exit  ·  ↑/↓ or PgUp/PgDn scroll\n" +
+				"The character auto-illustrates the scene every 3 rounds (toggle /autoimage).")
 		case "prompt":
 			if strings.TrimSpace(args) == "" {
 				pushSys("Usage: /prompt <direction> — steer upcoming replies.")
@@ -469,12 +538,26 @@ func (c *rawCardChat) Run() error {
 					Content: strings.TrimSpace(summary), Timestamp: time.Now().Unix(), Type: MessageTypeSummary}}
 			}()
 		case "image":
-			if strings.TrimSpace(args) == "" {
-				pushSys("Usage: /image <prompt>")
+			if isMock {
+				pushSys("Image generation needs a real provider (set POLLINATIONS_API_KEY in .env).")
+			} else if strings.TrimSpace(args) == "" {
+				// No prompt → illustrate the current scene from the last 3 messages.
+				busy = true
+				pushSys("🎬 Picturing the current scene…")
+				generateSceneImage()
 			} else {
 				busy = true
 				pushSys("🎨 Generating image: " + args)
 				generateImage(args)
+			}
+		case "autoimage", "auto":
+			switch strings.ToLower(strings.TrimSpace(args)) {
+			case "off", "0", "false", "no":
+				autoImage = false
+				pushSys("🎬 Auto scene-images OFF.")
+			default:
+				autoImage = true
+				pushSys("🎬 Auto scene-images ON — the character illustrates the scene every 3 rounds.")
 			}
 		default:
 			pushSys("Unknown command /" + cmd + " — try /help. (Full library features live in the main chat.)")
@@ -549,7 +632,18 @@ func (c *rawCardChat) Run() error {
 				return nil
 			}
 			switch ev.kind {
-			case "reply", "sys":
+			case "reply":
+				busy = false
+				messages = append(messages, ev.msg)
+				userScrolled = false
+				// The character illustrates the scene every 3rd reply.
+				roundCount++
+				if autoImage && !isMock && roundCount%3 == 0 {
+					busy = true
+					pushSys("🎬 " + cardName + " pictures the scene…")
+					generateSceneImage()
+				}
+			case "sys":
 				busy = false
 				messages = append(messages, ev.msg)
 				userScrolled = false

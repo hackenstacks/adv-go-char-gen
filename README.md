@@ -1,8 +1,10 @@
-# ⬡ char-gen-cli
+# ⬡ adv-go-char-gen
 
-> AI character generator, card browser, and multi-AI chat — all in one terminal app. Part of the NeXuS stack.
+> Advanced AI character generator, true-color sixel card browser, and multi-AI chat — all in one terminal app. Part of the NeXuS stack.
 
 **Author: hackenstacks** — [@hackenstacks](https://github.com/hackenstacks) — [hackenstacks@gmail.com](mailto:hackenstacks@gmail.com)
+
+True-color everywhere: the card browser and the chat are raw-terminal screens that render crisp **sixel** images (best in `foot`, outside tmux). The character illustrates the scene beside its avatar as you talk.
 
 ## ✨ Features
 
@@ -34,29 +36,27 @@
 
 1.  **Build the application:**
     ```bash
-    go build .
+    go build -o adv-go-char-gen .
     ```
-2.  **Run the application:**
+2.  **Run the application (best in foot, outside tmux, for sixel):**
     ```bash
-    ./char-gen-cli
+    ./adv-go-char-gen
     ```
+    Card directory defaults to `./cards` — override with `CARDS_DIR=~/my-cards ./adv-go-char-gen`.
 
-## 📝 Commands
+## 📝 Chat Commands
 
-*   `/help`: Show a list of available commands.
-*   `/summarize`: Summarize the current conversation.
-*   `/character {name} {message}`: Send a message to a specific character.
-*   `/save`: Save the current chat session.
-*   `/narrator {prompt}`: Use a narrator to guide the story.
-*   `/ai2ai {topic}`: Have two AIs converse on a given topic.
-*   `/quit` or `/end`: Exit the application.
-*   `/image {prompt}`: Generate an image.
-*   `/review`: Review the chat back to the last summary.
-*   `/system {prompt}`: Set a system prompt to steer the conversation.
-*   `/dm {character} {message}`: Send a private message to a character.
-*   `/invite {character}`: Invite a character to the current chat.
-*   `/upload {path}`: Upload a file.
-*   `/topic {message}`: Set or change the topic of conversation.
-*   `/boot {character}`: Remove a character from the chat.
-*   `/lore {entry}`: Add a lore book entry.
-*   `/note {message}`: Add a special note.
+*   `/help`: Show available commands and shortcuts.
+*   `/image {prompt}`: Generate an image (shown beside the avatar).
+*   `/image`: With no prompt, the character illustrates the **current scene** from the last 3 messages.
+*   `/autoimage on|off`: Toggle auto scene-illustration every 3 rounds (on by default).
+*   `/memory`: View this character's memory. `/commit {fact}`: Save a fact to memory.
+*   `/compact`: Summarize the conversation so far. `/prompt {text}`: Steer upcoming replies.
+*   `/save`: Save the chat session. `/export`: Export the conversation as JSON.
+*   `/models`: List available models. `/exit`: Leave the chat.
+
+**Reply-bar shortcuts:** `^G` /image · `^O` /memory · `^K` /compact · `^E` /export · `^S` /save · `^X` exit · `↑/↓` `PgUp/PgDn` scroll.
+
+---
+
+*Part of the NeXuS stack — © hackenstacks · [hackenstacks@gmail.com](mailto:hackenstacks@gmail.com)*
