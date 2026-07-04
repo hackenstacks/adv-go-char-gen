@@ -118,10 +118,10 @@ func (c *rawCardChat) Run() error {
 	busy := false
 	spin := 0
 
-	// A generated/shared image is shown in the empty space to the RIGHT of the
-	// avatar (its own rows, positioned absolutely) — it persists until replaced.
-	sideImage := ""
-	sidePrompt := ""
+	// Generated/shared images accumulate as a filmstrip across the top row, to
+	// the RIGHT of the avatar — each on its own rows, positioned absolutely, and
+	// retained (the most recent that fit are shown).
+	var strip []string // image file paths, oldest→newest
 
 	// Scene-image auto-illustration: every 3 character rounds the AI paints the
 	// current scene beside the avatar. Toggle with /autoimage.
@@ -160,24 +160,39 @@ func (c *rawCardChat) Run() error {
 	}
 	layout()
 
-	// drawSideImage paints the current image beside the avatar (or clears the
-	// slot's caption). Called from fullDraw and whenever the image changes.
-	drawSideImage := func() {
-		if sideImage == "" {
+	// drawFilmstrip paints the retained images across the top row, right of the
+	// avatar. Each thumbnail is emitted at an absolute cursor position (the only
+	// reliable way to place multiple sixels), most-recent last, filling the row.
+	drawFilmstrip := func() {
+		if len(strip) == 0 {
 			return
 		}
-		sideCol := avW + 3
-		sideW := cols - sideCol
-		if sideW < 12 {
-			return // not enough room; the conversation note still points to the file
+		startCol := avW + 3
+		avail := cols - startCol
+		if avail < 14 {
+			return // no room beside the avatar
 		}
-		fmt.Fprint(out, at(2, sideCol))
-		renderSixel(out, sideImage, sideW, avH)
-		caption := sidePrompt
-		if len(caption) > sideW-2 {
-			caption = caption[:sideW-3] + "…"
+		thumbW := 2 * avH // square images need ~2 cols per row of height
+		if thumbW < 12 {
+			thumbW = 12
 		}
-		fmt.Fprint(out, at(1+avH, sideCol)+cPurple+"🖼 "+cReset+cMuted+caption+cReset)
+		per := thumbW + 1
+		n := avail / per
+		if n < 1 {
+			n = 1
+		}
+		items := strip
+		if len(items) > n {
+			items = items[len(items)-n:] // most recent that fit
+		}
+		col := startCol
+		for _, p := range items {
+			fmt.Fprint(out, at(2, col))
+			renderSixel(out, p, thumbW, avH)
+			col += per
+		}
+		fmt.Fprint(out, at(1+avH, startCol)+cPurple+"🖼 "+cReset+
+			cMuted+fmt.Sprintf("%d image(s) this session", len(strip))+cReset)
 	}
 
 	convWidth := func() int {
@@ -296,7 +311,7 @@ func (c *rawCardChat) Run() error {
 		// True-color sixel avatar (its own rows — text never shares them).
 		fmt.Fprint(out, at(2, 1))
 		renderSixel(out, c.cardPath, avW, avH)
-		drawSideImage()
+		drawFilmstrip()
 		redrawConv()
 		redrawInput()
 	}
@@ -653,11 +668,12 @@ func (c *rawCardChat) Run() error {
 				userScrolled = false
 			case "image":
 				busy = false
-				sideImage = ev.imgPath
-				sidePrompt = ev.imgPrompt
-				pushSys("🖼  Image → " + ev.imgPath + "  (shown beside avatar)")
+				strip = append(strip, ev.imgPath)
+				pushSys("🖼  Image → " + ev.imgPath + "  (added to the top row)")
 				userScrolled = false
-				drawSideImage()
+				// Full clean redraw so the sixel strip renders reliably.
+				fullDraw()
+				continue
 			}
 			redrawConv()
 			redrawInput()
