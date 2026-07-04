@@ -1,0 +1,17 @@
+# Secrets — never commit
+.env
+*.env
+
+# Build artifacts
+adv-go-char-gen
+char-gen-cli
+char-gen-cli-test
+debug.log
+*.bak
+*.tmp
+
+# Local data
+storage/
+users/
+cards/
+exports/
