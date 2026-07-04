@@ -170,7 +170,11 @@ func (m cardEditorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.portrait = msg.portrait
 		m.fields = makeFields(msg.card)
 		m.viewport.SetContent(m.renderFields())
-		return m, textinput.Blink
+		// Greet with the crisp true-color (sixel) portrait; any key drops into
+		// the editor. The inline portrait below is symbols (bubbletea can't hold
+		// a sixel); ctrl+p re-opens this true-color view anytime.
+		name := msg.card.Name()
+		return m, tea.Batch(textinput.Blink, runImagePreviewCmd(m.cardPath, name))
 
 	case cardSavedMsg:
 		m.status = msg.status
@@ -406,6 +410,7 @@ func (m cardEditorModel) View() string {
 	if len(shortPath) > 30 { shortPath = "..." + shortPath[len(shortPath)-27:] }
 	metaBlock := ePortraitBox.Render(
 		portraitContent + "\n" +
+		eKeyStyle.Render("ctrl+p") + eHelpStyle.Render(" true-color view") + "\n" +
 		eHelpStyle.Render(shortPath),
 	)
 
