@@ -118,8 +118,13 @@ func (c *rawCardChat) Run() error {
 	busy := false
 	spin := 0
 
+	// A generated/shared image is shown in the empty space to the RIGHT of the
+	// avatar (its own rows, positioned absolutely) — it persists until replaced.
+	sideImage := ""
+	sidePrompt := ""
+
 	// Layout, recomputed on resize.
-	var cols, rows, avH, convTop, convBottom, barRow, inputRow int
+	var cols, rows, avH, avW, convTop, convBottom, barRow, inputRow int
 	layout := func() {
 		cols, rows, _ = term.GetSize(fd)
 		if cols <= 0 {
@@ -135,6 +140,10 @@ func (c *rawCardChat) Run() error {
 		if avH > 14 {
 			avH = 14
 		}
+		avW = avH * 3 / 2
+		if avW > cols-2 {
+			avW = cols - 2
+		}
 		convTop = 3 + avH   // header(1) + avatar(avH) + separator(1), then conv
 		inputRow = rows
 		barRow = rows - 1
@@ -144,6 +153,26 @@ func (c *rawCardChat) Run() error {
 		}
 	}
 	layout()
+
+	// drawSideImage paints the current image beside the avatar (or clears the
+	// slot's caption). Called from fullDraw and whenever the image changes.
+	drawSideImage := func() {
+		if sideImage == "" {
+			return
+		}
+		sideCol := avW + 3
+		sideW := cols - sideCol
+		if sideW < 12 {
+			return // not enough room; the conversation note still points to the file
+		}
+		fmt.Fprint(out, at(2, sideCol))
+		renderSixel(out, sideImage, sideW, avH)
+		caption := sidePrompt
+		if len(caption) > sideW-2 {
+			caption = caption[:sideW-3] + "…"
+		}
+		fmt.Fprint(out, at(1+avH, sideCol)+cPurple+"🖼 "+cReset+cMuted+caption+cReset)
+	}
 
 	convWidth := func() int {
 		w := cols - 2
@@ -259,12 +288,9 @@ func (c *rawCardChat) Run() error {
 		sb.WriteString(at(2+avH, 1) + cMuted + strings.Repeat("─", cols) + cReset)
 		fmt.Fprint(out, sb.String())
 		// True-color sixel avatar (its own rows — text never shares them).
-		avW := avH * 3 / 2
-		if avW > cols-2 {
-			avW = cols - 2
-		}
 		fmt.Fprint(out, at(2, 1))
 		renderSixel(out, c.cardPath, avW, avH)
+		drawSideImage()
 		redrawConv()
 		redrawInput()
 	}
@@ -341,36 +367,8 @@ func (c *rawCardChat) Run() error {
 		}()
 	}
 
-	// showImageFullscreen paints one image full-screen in true sixel until a key
-	// press, then restores the chat. We already own the terminal, so no nesting.
-	showImageFullscreen := func(path, prompt string, keyCh <-chan []byte) {
-		ph := rows - 3
-		if ph < 10 {
-			ph = 10
-		}
-		pw := ph * 3 / 2
-		if pw > cols-2 {
-			pw = cols - 2
-		}
-		fmt.Fprint(out, ansiClear+at(1, 1)+cCyan+cBold+"⬡ "+prompt+cReset)
-		fmt.Fprint(out, at(2, 1))
-		renderSixel(out, path, pw, ph)
-		fmt.Fprint(out, at(rows, 1)+cMuted+"  press any key to return to chat"+cReset)
-		// Drain buffered input briefly, then wait for a real keypress.
-		drain := time.NewTimer(300 * time.Millisecond)
-		draining := true
-		for draining {
-			select {
-			case <-keyCh:
-			case <-drain.C:
-				draining = false
-			}
-		}
-		<-keyCh
-	}
-
 	// handleCommand runs a slash command. Returns true if the chat should exit.
-	handleCommand := func(cmd, args string, keyCh <-chan []byte) bool {
+	handleCommand := func(cmd, args string) bool {
 		switch cmd {
 		case "exit", "quit", "q":
 			c.action = "back"
@@ -508,7 +506,7 @@ func (c *rawCardChat) Run() error {
 	spinner := time.NewTicker(120 * time.Millisecond)
 	defer spinner.Stop()
 
-	submit := func(keyCh <-chan []byte) bool {
+	submit := func() bool {
 		line := strings.TrimSpace(input)
 		input = ""
 		if line == "" {
@@ -521,7 +519,7 @@ func (c *rawCardChat) Run() error {
 			if len(parts) > 1 {
 				args = parts[1]
 			}
-			return handleCommand(cmd, args, keyCh)
+			return handleCommand(cmd, args)
 		}
 		// Ordinary message → user turn + async reply.
 		messages = append(messages, Message{ID: GenerateRandomID(), Sender: c.user.Username,
@@ -561,11 +559,11 @@ func (c *rawCardChat) Run() error {
 				userScrolled = false
 			case "image":
 				busy = false
-				showImageFullscreen(ev.imgPath, ev.imgPrompt, keyCh)
-				pushSys("🖼  Image saved → " + ev.imgPath)
+				sideImage = ev.imgPath
+				sidePrompt = ev.imgPrompt
+				pushSys("🖼  Image → " + ev.imgPath + "  (shown beside avatar)")
 				userScrolled = false
-				fullDraw()
-				continue
+				drawSideImage()
 			}
 			redrawConv()
 			redrawInput()
@@ -609,7 +607,7 @@ func (c *rawCardChat) Run() error {
 				c.action = "back"
 				return nil
 			case b0 == '\r' || b0 == '\n':
-				if submit(keyCh) {
+				if submit() {
 					return nil
 				}
 				redrawConv()
@@ -623,19 +621,19 @@ func (c *rawCardChat) Run() error {
 				input = "/image "
 				redrawInput()
 			case b0 == 15: // Ctrl+O → /memory
-				handleCommand("memory", "", keyCh)
+				handleCommand("memory", "")
 				redrawConv()
 				redrawInput()
 			case b0 == 11: // Ctrl+K → /compact
-				handleCommand("compact", "", keyCh)
+				handleCommand("compact", "")
 				redrawConv()
 				redrawInput()
 			case b0 == 5: // Ctrl+E → /export
-				handleCommand("export", "", keyCh)
+				handleCommand("export", "")
 				redrawConv()
 				redrawInput()
 			case b0 == 19: // Ctrl+S → /save
-				handleCommand("save", "", keyCh)
+				handleCommand("save", "")
 				redrawConv()
 				redrawInput()
 			case b0 >= 32 && b0 < 127: // printable (single byte)
