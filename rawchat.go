@@ -1,0 +1,702 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
+	cc "github.com/hackenstacks/nexus-charcard"
+)
+
+// rawCardChat is a NON-curses chat screen. Like rawCardBrowser it implements
+// tea.ExecCommand so bubbletea releases the terminal; we then take raw control
+// and render a TRUE-COLOR sixel avatar (via renderSixel) with the conversation
+// and input placed by absolute cursor moves. This is the only way to show a
+// crisp sixel image alongside live text — the whole reason the browser went raw.
+type rawCardChat struct {
+	user     *User
+	cardPath string
+	stdin    io.Reader
+	stdout   io.Writer
+
+	action string // "back"
+}
+
+func (c *rawCardChat) SetStdin(r io.Reader)  { c.stdin = r }
+func (c *rawCardChat) SetStdout(w io.Writer) { c.stdout = w }
+func (c *rawCardChat) SetStderr(w io.Writer) {}
+
+const ansiClrLine = "\033[2K"
+
+// chatEvent is delivered from background goroutines (LLM / image work) to the
+// main input loop so the UI never blocks while waiting on the network.
+type chatEvent struct {
+	kind      string // "reply" | "error" | "image" | "sys"
+	msg       Message
+	imgPath   string
+	imgPrompt string
+}
+
+// spinnerFrames animates the "typing…" indicator.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func (c *rawCardChat) Run() error {
+	out := c.stdout
+	if out == nil {
+		out = os.Stdout
+	}
+
+	// ── Load config, services, and the card persona ──────────────────────────
+	apiCfg, _ := LoadAPIConfig(c.user)
+	LoadEnvOverlay(&apiCfg)
+	mm := NewLocalMemoryManager(nil, nil)
+	llmSvc, _ := LLMFactory(apiCfg.SelectedLLMProvider, apiCfg)
+	imgSvc, _ := ImageFactory(apiCfg.SelectedImageProvider, apiCfg)
+	if llmSvc == nil {
+		llmSvc, _ = LLMFactory(ProviderMock, apiCfg)
+	}
+	if imgSvc == nil {
+		imgSvc, _ = ImageFactory(ProviderMock, apiCfg)
+	}
+
+	provider := apiCfg.SelectedLLMProvider
+	model := resolveDefaultModel(&apiCfg)
+	imgModel := string(apiCfg.Pollinations.DefaultImageModel)
+	if imgModel == "" {
+		imgModel = "flux"
+	}
+
+	card, err := cc.LoadFromPNG(c.cardPath)
+	if err != nil || card == nil {
+		c.action = "back"
+		return nil
+	}
+	cardName := card.Name()
+	sysPrompt := card.SystemPrompt(c.user.Username)
+	memID := "card:" + cardName
+
+	var messages []Message
+	pushSys := func(s string) {
+		messages = append(messages, Message{ID: GenerateRandomID(), Sender: "System",
+			Content: s, Timestamp: time.Now().Unix(), Type: MessageTypeSystem})
+	}
+	if provider == ProviderMock || provider == "" {
+		pushSys("⚠ No AI provider configured — replies are mock text. Set a provider in .env (e.g. POLLINATIONS_API_KEY or CUSTOM_API_URL).")
+	}
+	pushSys(fmt.Sprintf("Chatting with %s via %s (%s) — /help for commands, /exit to leave.", cardName, provider, model))
+	if card.Data != nil && strings.TrimSpace(card.Data.FirstMes) != "" {
+		greeting := strings.ReplaceAll(strings.ReplaceAll(card.Data.FirstMes, "{{char}}", cardName), "{{user}}", c.user.Username)
+		messages = append(messages, Message{ID: GenerateRandomID(), Sender: cardName,
+			Content: greeting, Timestamp: time.Now().Unix(), Type: MessageTypeCharacter})
+	}
+
+	// ── Raw terminal ─────────────────────────────────────────────────────────
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		c.action = "back"
+		return nil
+	}
+	defer term.Restore(fd, oldState)
+	fmt.Fprint(out, ansiHideCur)
+	defer fmt.Fprint(out, ansiShowCur+cReset+ansiClear)
+
+	// ── Runtime state ────────────────────────────────────────────────────────
+	input := ""
+	scroll := 0
+	userScrolled := false
+	busy := false
+	spin := 0
+
+	// Layout, recomputed on resize.
+	var cols, rows, avH, convTop, convBottom, barRow, inputRow int
+	layout := func() {
+		cols, rows, _ = term.GetSize(fd)
+		if cols <= 0 {
+			cols = 100
+		}
+		if rows <= 0 {
+			rows = 40
+		}
+		avH = rows / 3
+		if avH < 8 {
+			avH = 8
+		}
+		if avH > 14 {
+			avH = 14
+		}
+		convTop = 3 + avH   // header(1) + avatar(avH) + separator(1), then conv
+		inputRow = rows
+		barRow = rows - 1
+		convBottom = rows - 2
+		if convBottom < convTop {
+			convBottom = convTop
+		}
+	}
+	layout()
+
+	convWidth := func() int {
+		w := cols - 2
+		if w < 20 {
+			w = 20
+		}
+		return w
+	}
+
+	// buildDisplayLines flattens the conversation into wrapped, colored lines.
+	buildDisplayLines := func() []string {
+		w := convWidth()
+		var lines []string
+		for _, msg := range messages {
+			var label string
+			switch msg.Type {
+			case MessageTypeUser:
+				label = cCyan + cBold + "You" + cReset
+			case MessageTypeCharacter:
+				label = cGreen + cBold + "⬡ " + msg.Sender + cReset
+			case MessageTypeSummary:
+				label = cPurple + cBold + "▤ Summary" + cReset
+			default:
+				label = cMuted + msg.Sender + cReset
+			}
+			lines = append(lines, label)
+			bodyColor := cReset
+			if msg.Type == MessageTypeSystem {
+				bodyColor = cMuted
+			}
+			for _, bl := range wrapAll(msg.Content, w) {
+				lines = append(lines, bodyColor+bl+cReset)
+			}
+			lines = append(lines, "")
+		}
+		return lines
+	}
+
+	// redrawConv paints only the conversation region (never the sixel rows), so
+	// typing and new messages don't cause the avatar to flicker.
+	redrawConv := func() {
+		lines := buildDisplayLines()
+		convH := convBottom - convTop + 1
+		maxScroll := len(lines) - convH
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if !userScrolled {
+			scroll = maxScroll
+		}
+		if scroll > maxScroll {
+			scroll = maxScroll
+		}
+		if scroll < 0 {
+			scroll = 0
+		}
+		var sb strings.Builder
+		for i := 0; i < convH; i++ {
+			row := convTop + i
+			sb.WriteString(at(row, 1) + ansiClrLine)
+			idx := scroll + i
+			if idx < len(lines) {
+				sb.WriteString(lines[idx])
+			}
+		}
+		// Scroll hint when more is above/below.
+		if maxScroll > 0 {
+			pos := fmt.Sprintf("%s↑↓ %d/%d%s", cMuted, scroll, maxScroll, cReset)
+			sb.WriteString(at(convTop, cols-visLen(pos)) + pos)
+		}
+		fmt.Fprint(out, sb.String())
+	}
+
+	// redrawInput paints the quick-launch bar + the reply box.
+	redrawInput := func() {
+		var sb strings.Builder
+		// Quick-launch bar (or status while busy).
+		sb.WriteString(at(barRow, 1) + ansiClrLine)
+		if busy {
+			sb.WriteString(fmt.Sprintf("%s%s %s is thinking…%s", cGreen, spinnerFrames[spin%len(spinnerFrames)], cardName, cReset))
+		} else {
+			qk := func(k, label string) string {
+				return cGreen + k + cReset + cMuted + " " + label + cReset
+			}
+			bar := strings.Join([]string{
+				qk("^G", "/image"), qk("^O", "/memory"), qk("^K", "/compact"),
+				qk("^E", "/export"), qk("^S", "/save"), qk("^X", "exit"),
+			}, cMuted+"  ·  "+cReset)
+			sb.WriteString(bar)
+		}
+		// Reply box.
+		sb.WriteString(at(inputRow, 1) + ansiClrLine)
+		prompt := cCyan + cBold + ">> " + cReset
+		shown := input
+		// Keep the tail visible if the line is longer than the terminal.
+		maxIn := cols - 5
+		if len(shown) > maxIn && maxIn > 0 {
+			shown = "…" + shown[len(shown)-maxIn+1:]
+		}
+		sb.WriteString(prompt + shown + cGreen + "▌" + cReset)
+		fmt.Fprint(out, sb.String())
+	}
+
+	fullDraw := func() {
+		layout()
+		var sb strings.Builder
+		sb.WriteString(ansiClear)
+		// Header line.
+		header := fmt.Sprintf("%s%s⬡ %s%s  %s%s · %s%s",
+			cCyan, cBold, cardName, cReset, cMuted, provider, model, cReset)
+		sb.WriteString(at(1, 1) + header)
+		// Separator under the avatar.
+		sb.WriteString(at(2+avH, 1) + cMuted + strings.Repeat("─", cols) + cReset)
+		fmt.Fprint(out, sb.String())
+		// True-color sixel avatar (its own rows — text never shares them).
+		avW := avH * 3 / 2
+		if avW > cols-2 {
+			avW = cols - 2
+		}
+		fmt.Fprint(out, at(2, 1))
+		renderSixel(out, c.cardPath, avW, avH)
+		redrawConv()
+		redrawInput()
+	}
+
+	// buildPrompt assembles the LLM prompt from persona + recent history.
+	buildPrompt := func() string {
+		var b strings.Builder
+		b.WriteString(sysPrompt)
+		b.WriteString("\n\nYou are ")
+		b.WriteString(cardName)
+		b.WriteString(". Stay in character. Respond only as ")
+		b.WriteString(cardName)
+		b.WriteString(".\n\n--- Conversation ---\n")
+		start := 0
+		if len(messages) > 16 {
+			start = len(messages) - 16
+		}
+		for i := start; i < len(messages); i++ {
+			mm := messages[i]
+			if mm.Type == MessageTypeSystem || mm.Type == MessageTypeCommand {
+				continue
+			}
+			b.WriteString(mm.Sender + ": " + mm.Content + "\n")
+		}
+		b.WriteString(cardName + ": ")
+		return b.String()
+	}
+
+	events := make(chan chatEvent, 4)
+
+	// sendToLLM fires the reply request in the background.
+	sendToLLM := func() {
+		prompt := buildPrompt()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			resp, err := llmSvc.GenerateResponse(ctx, prompt, LLMModel(model), apiCfg)
+			if err != nil {
+				events <- chatEvent{kind: "error", msg: Message{Content: err.Error()}}
+				return
+			}
+			events <- chatEvent{kind: "reply", msg: Message{ID: GenerateRandomID(), Sender: cardName,
+				Content: strings.TrimSpace(resp), Timestamp: time.Now().Unix(), Type: MessageTypeCharacter}}
+		}()
+	}
+
+	// generateImage fires image generation in the background.
+	generateImage := func(prompt string) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			data, err := imgSvc.GenerateImage(ctx, prompt, ImageModel(imgModel))
+			if err != nil {
+				events <- chatEvent{kind: "error", msg: Message{Content: "image generation failed: " + err.Error()}}
+				return
+			}
+			dir := filepath.Join(Paths.DataDir, "images")
+			os.MkdirAll(dir, 0755)
+			path := filepath.Join(dir, fmt.Sprintf("img-%d.jpg", time.Now().Unix()))
+			if strings.HasPrefix(data, "http") {
+				if err := downloadImage(ctx, data, path); err != nil {
+					events <- chatEvent{kind: "error", msg: Message{Content: "image download failed: " + err.Error()}}
+					return
+				}
+			} else {
+				raw, derr := base64.StdEncoding.DecodeString(data)
+				if derr != nil {
+					events <- chatEvent{kind: "error", msg: Message{Content: "decode image: " + derr.Error()}}
+					return
+				}
+				os.WriteFile(path, raw, 0644)
+			}
+			events <- chatEvent{kind: "image", imgPath: path, imgPrompt: prompt}
+		}()
+	}
+
+	// showImageFullscreen paints one image full-screen in true sixel until a key
+	// press, then restores the chat. We already own the terminal, so no nesting.
+	showImageFullscreen := func(path, prompt string, keyCh <-chan []byte) {
+		ph := rows - 3
+		if ph < 10 {
+			ph = 10
+		}
+		pw := ph * 3 / 2
+		if pw > cols-2 {
+			pw = cols - 2
+		}
+		fmt.Fprint(out, ansiClear+at(1, 1)+cCyan+cBold+"⬡ "+prompt+cReset)
+		fmt.Fprint(out, at(2, 1))
+		renderSixel(out, path, pw, ph)
+		fmt.Fprint(out, at(rows, 1)+cMuted+"  press any key to return to chat"+cReset)
+		// Drain buffered input briefly, then wait for a real keypress.
+		drain := time.NewTimer(300 * time.Millisecond)
+		draining := true
+		for draining {
+			select {
+			case <-keyCh:
+			case <-drain.C:
+				draining = false
+			}
+		}
+		<-keyCh
+	}
+
+	// handleCommand runs a slash command. Returns true if the chat should exit.
+	handleCommand := func(cmd, args string, keyCh <-chan []byte) bool {
+		switch cmd {
+		case "exit", "quit", "q":
+			c.action = "back"
+			return true
+		case "help":
+			pushSys("Commands: /image <prompt> · /memory · /commit <fact> · /compact · /prompt <text> · " +
+				"/save · /export · /models · /exit   |   Shortcuts: ^G image  ^O memory  ^K compact  ^E export  ^S save  ^X exit  ·  ↑/↓ or PgUp/PgDn scroll")
+		case "prompt":
+			if strings.TrimSpace(args) == "" {
+				pushSys("Usage: /prompt <direction> — steer upcoming replies.")
+			} else {
+				sysPrompt += "\n\n[Director's note: " + args + "]"
+				pushSys("📝 Directive added.")
+			}
+		case "commit":
+			if strings.TrimSpace(args) == "" {
+				pushSys("Usage: /commit <fact>")
+			} else {
+				entry := &MemoryEntry{Content: args, Type: "semantic", Source: "user /commit", Keywords: []string{cardName}}
+				if err := mm.AddMemory(c.user, memID, entry, &apiCfg); err != nil {
+					pushSys("Memory error: " + err.Error())
+				} else {
+					pushSys("🧠 Committed: " + args)
+				}
+			}
+		case "memory":
+			mems, err := mm.RetrieveMemories(c.user, memID, "", 50, &apiCfg)
+			if err != nil {
+				pushSys("Memory error: " + err.Error())
+			} else if len(mems) == 0 {
+				pushSys("No memories for " + cardName + " yet. Use /commit <fact>.")
+			} else {
+				var b strings.Builder
+				b.WriteString(fmt.Sprintf("🧠 %s's memory (%d):", cardName, len(mems)))
+				for i, mem := range mems {
+					if i >= 20 {
+						break
+					}
+					b.WriteString("\n  • " + mem.Content)
+				}
+				pushSys(b.String())
+			}
+		case "save":
+			if err := SaveChatSession(c.user, memID, messages); err != nil {
+				pushSys("Save failed: " + err.Error())
+			} else {
+				pushSys("💾 Conversation saved.")
+			}
+		case "export":
+			dir := filepath.Join(Paths.DataDir, "exports")
+			os.MkdirAll(dir, 0755)
+			name := strings.ToLower(strings.ReplaceAll(cardName, " ", "-"))
+			if name == "" {
+				name = "chat"
+			}
+			path := filepath.Join(dir, fmt.Sprintf("%s-%d.json", name, time.Now().Unix()))
+			data, _ := json.MarshalIndent(messages, "", "  ")
+			if err := os.WriteFile(path, data, 0644); err != nil {
+				pushSys("Export failed: " + err.Error())
+			} else {
+				pushSys("📤 Exported → " + path)
+			}
+		case "models":
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			mdls, err := llmSvc.GetAvailableModels(ctx)
+			cancel()
+			if err != nil {
+				pushSys("Models error: " + err.Error())
+			} else {
+				names := make([]string, len(mdls))
+				for i, md := range mdls {
+					names[i] = string(md)
+				}
+				pushSys("Available models: " + strings.Join(names, ", "))
+			}
+		case "compact":
+			busy = true
+			redrawInput()
+			snapshot := make([]Message, len(messages))
+			copy(snapshot, messages)
+			go func() {
+				var b strings.Builder
+				b.WriteString("Summarize the following roleplay conversation concisely, preserving key events, facts, and the current situation. Write it as a recap.\n\n")
+				for _, mm := range snapshot {
+					if mm.Type == MessageTypeSystem || mm.Type == MessageTypeCommand {
+						continue
+					}
+					b.WriteString(mm.Sender + ": " + mm.Content + "\n")
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				summary, err := llmSvc.GenerateResponse(ctx, b.String(), LLMModel(model), apiCfg)
+				if err != nil {
+					events <- chatEvent{kind: "error", msg: Message{Content: "compact failed: " + err.Error()}}
+					return
+				}
+				events <- chatEvent{kind: "sys", msg: Message{ID: GenerateRandomID(), Sender: "Summary",
+					Content: strings.TrimSpace(summary), Timestamp: time.Now().Unix(), Type: MessageTypeSummary}}
+			}()
+		case "image":
+			if strings.TrimSpace(args) == "" {
+				pushSys("Usage: /image <prompt>")
+			} else {
+				busy = true
+				pushSys("🎨 Generating image: " + args)
+				generateImage(args)
+			}
+		default:
+			pushSys("Unknown command /" + cmd + " — try /help. (Full library features live in the main chat.)")
+	}
+		return false
+	}
+
+	// ── Background key reader (select-able) ──────────────────────────────────
+	keyCh := make(chan []byte, 16)
+	go func() {
+		b := make([]byte, 16)
+		for {
+			n, err := c.stdin.Read(b)
+			if err != nil || n == 0 {
+				close(keyCh)
+				return
+			}
+			cp := make([]byte, n)
+			copy(cp, b[:n])
+			keyCh <- cp
+		}
+	}()
+
+	// Resize via SIGWINCH.
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	defer signal.Stop(winch)
+
+	spinner := time.NewTicker(120 * time.Millisecond)
+	defer spinner.Stop()
+
+	submit := func(keyCh <-chan []byte) bool {
+		line := strings.TrimSpace(input)
+		input = ""
+		if line == "" {
+			return false
+		}
+		if strings.HasPrefix(line, "/") {
+			parts := strings.SplitN(strings.TrimPrefix(line, "/"), " ", 2)
+			cmd := strings.ToLower(parts[0])
+			args := ""
+			if len(parts) > 1 {
+				args = parts[1]
+			}
+			return handleCommand(cmd, args, keyCh)
+		}
+		// Ordinary message → user turn + async reply.
+		messages = append(messages, Message{ID: GenerateRandomID(), Sender: c.user.Username,
+			Content: line, Timestamp: time.Now().Unix(), Type: MessageTypeUser})
+		userScrolled = false
+		busy = true
+		sendToLLM()
+		return false
+	}
+
+	fullDraw()
+
+	for {
+		select {
+		case <-winch:
+			fullDraw()
+
+		case <-spinner.C:
+			if busy {
+				spin++
+				redrawInput()
+			}
+
+		case ev, ok := <-events:
+			if !ok {
+				c.action = "back"
+				return nil
+			}
+			switch ev.kind {
+			case "reply", "sys":
+				busy = false
+				messages = append(messages, ev.msg)
+				userScrolled = false
+			case "error":
+				busy = false
+				pushSys("⚠ " + ev.msg.Content)
+				userScrolled = false
+			case "image":
+				busy = false
+				showImageFullscreen(ev.imgPath, ev.imgPrompt, keyCh)
+				pushSys("🖼  Image saved → " + ev.imgPath)
+				userScrolled = false
+				fullDraw()
+				continue
+			}
+			redrawConv()
+			redrawInput()
+
+		case key, ok := <-keyCh:
+			if !ok {
+				c.action = "back"
+				return nil
+			}
+			n := len(key)
+			// Arrow / page keys.
+			if n >= 3 && key[0] == 0x1b && key[1] == '[' {
+				switch key[2] {
+				case 'A': // up
+					if scroll > 0 {
+						scroll--
+						userScrolled = true
+					}
+				case 'B': // down
+					scroll++
+					userScrolled = true
+				case '5': // PgUp
+					scroll -= (convBottom - convTop)
+					if scroll < 0 {
+						scroll = 0
+					}
+					userScrolled = true
+				case '6': // PgDn
+					scroll += (convBottom - convTop)
+					userScrolled = true
+				}
+				redrawConv()
+				continue
+			}
+			b0 := key[0]
+			switch {
+			case b0 == 0x1b && n == 1: // Esc → exit
+				c.action = "back"
+				return nil
+			case b0 == 3, b0 == 24: // Ctrl+C / Ctrl+X → exit
+				c.action = "back"
+				return nil
+			case b0 == '\r' || b0 == '\n':
+				if submit(keyCh) {
+					return nil
+				}
+				redrawConv()
+				redrawInput()
+			case b0 == 0x7f || b0 == 8: // Backspace
+				if len(input) > 0 {
+					input = input[:len(input)-1]
+				}
+				redrawInput()
+			case b0 == 7: // Ctrl+G → prefill /image
+				input = "/image "
+				redrawInput()
+			case b0 == 15: // Ctrl+O → /memory
+				handleCommand("memory", "", keyCh)
+				redrawConv()
+				redrawInput()
+			case b0 == 11: // Ctrl+K → /compact
+				handleCommand("compact", "", keyCh)
+				redrawConv()
+				redrawInput()
+			case b0 == 5: // Ctrl+E → /export
+				handleCommand("export", "", keyCh)
+				redrawConv()
+				redrawInput()
+			case b0 == 19: // Ctrl+S → /save
+				handleCommand("save", "", keyCh)
+				redrawConv()
+				redrawInput()
+			case b0 >= 32 && b0 < 127: // printable (single byte)
+				if n == 1 {
+					input += string(rune(b0))
+				} else {
+					// paste / multibyte: append printable bytes
+					for _, bb := range key {
+						if bb >= 32 && bb < 127 {
+							input += string(rune(bb))
+						}
+					}
+				}
+				redrawInput()
+			}
+		}
+	}
+}
+
+// wrapAll word-wraps text to width, honoring explicit newlines. Unlike wrapLines
+// it returns every line (no cap) so the whole conversation can scroll.
+func wrapAll(s string, width int) []string {
+	if width < 4 {
+		width = 4
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		if strings.TrimSpace(para) == "" {
+			out = append(out, "")
+			continue
+		}
+		line := ""
+		for _, w := range strings.Fields(para) {
+			// Break a single over-long word.
+			for len(w) > width {
+				if line != "" {
+					out = append(out, line)
+					line = ""
+				}
+				out = append(out, w[:width])
+				w = w[width:]
+			}
+			switch {
+			case line == "":
+				line = w
+			case len(line)+1+len(w) <= width:
+				line += " " + w
+			default:
+				out = append(out, line)
+				line = w
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// runRawChatCmd runs the raw sixel chat via tea.Exec, then returns to the browser.
+func runRawChatCmd(user *User, cardPath string) tea.Cmd {
+	c := &rawCardChat{user: user, cardPath: cardPath}
+	return tea.Exec(c, func(err error) tea.Msg {
+		return ShowCardBrowserMsg{}
+	})
+}

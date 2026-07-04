@@ -185,13 +185,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case ChatWithCardMsg:
-		m.state = ChatState
-		m.chatModel = initialChatModelFromCard(m.user, msg.CardPath)
-		w, h := m.width, m.height
-		return m, tea.Batch(
-			m.chatModel.Init(),
-			func() tea.Msg { return tea.WindowSizeMsg{Width: w, Height: h} },
-		)
+		// Raw (non-curses) chat: takes over the terminal for a true-color sixel
+		// avatar alongside live conversation, then returns to the browser.
+		return m, runRawChatCmd(m.user, msg.CardPath)
 
 	case BackToMainAppMsg:
 		// This message can come from any sub-model to return to the main app menu
