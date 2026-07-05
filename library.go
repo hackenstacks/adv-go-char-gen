@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
+	"sort"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -75,6 +77,8 @@ type libraryModel struct {
 	err         error
 	deleteSuccess bool
 	shareSuccess bool
+	exportSuccess bool
+	exportPath  string
 }
 
 func initialLibraryModel(u *User) libraryModel {
@@ -83,6 +87,7 @@ func initialLibraryModel(u *User) libraryModel {
 	if err != nil {
 		fmt.Printf("Error loading library files: %v\n", err)
 	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Timestamp.After(files[j].Timestamp) })
 	items := make([]list.Item, len(files))
 	for i, file := range files {
 		items[i] = libraryListItem{file: file}
@@ -149,6 +154,7 @@ func (m libraryModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil // Clear error on escape
 			m.deleteSuccess = false // Clear success message
 			m.shareSuccess = false // Clear share success message
+			m.exportSuccess = false // Clear export success message
 			if m.state == libraryListView {
 				return m, func() tea.Msg { return BackToMainAppMsg{} }
 			}
@@ -226,6 +232,29 @@ func (m libraryModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case "e": // Export file out of the encrypted store as a plain file
+			var target *LibraryFile
+			if m.state == libraryDetailView && m.selectedFile != nil {
+				target = m.selectedFile
+			} else if m.state == libraryListView {
+				if sel := m.fileList.SelectedItem(); sel != nil {
+					f := sel.(libraryListItem).file
+					target = &f
+				}
+			}
+			if target == nil {
+				m.err = fmt.Errorf("no file selected to export")
+				return m, nil
+			}
+			destDir := filepath.Join(Paths.DataDir, "exports")
+			outPath, err := ExportLibraryFile(m.user, target.ID, destDir)
+			if err != nil {
+				m.err = fmt.Errorf("failed to export file: %w", err)
+			} else {
+				m.exportSuccess = true
+				m.exportPath = outPath
+			}
+			return m, nil
 		case "v": // View file content (simple text for now)
 			if m.state == libraryDetailView && m.selectedFile != nil {
 				// Load and display content
@@ -275,12 +304,14 @@ func (m libraryModel) View() string {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Render("✅ File deleted successfully!") + "\n"
 	} else if m.shareSuccess {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Render("✅ File shared successfully!") + "\n"
+	} else if m.exportSuccess {
+		status = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Render("✅ Exported → "+m.exportPath) + "\n"
 	}
 
 	switch m.state {
 	case libraryListView:
 		s = m.fileList.View()
-		help = "\n↑/↓ move • enter view details • d delete • esc back • q quit"
+		help = "\n↑/↓ move • enter details • e export • d delete • esc back • q quit"
 	case libraryDetailView:
 		if m.selectedFile == nil {
 			s = "No file selected."
@@ -293,9 +324,9 @@ func (m libraryModel) View() string {
 				fmt.Sprintf("Stored Path: %s\n", m.selectedFile.StoredPath)
 			if m.selectedFile.Type == "text" || m.selectedFile.Type == "chat_log" || m.selectedFile.Type == "json" {
 				s += "\n-- Content Preview --\n" + m.selectedFile.OriginalPath // Displaying content temporarily here
-				help = "v view content • s share • esc back • q quit"
+				help = "v view content • s share • e export • esc back • q quit"
 			} else {
-				help = "s share • esc back • q quit"
+				help = "s share • e export • esc back • q quit"
 			}
 			s = libraryFileDetailStyle.Render(s)
 		}
@@ -325,6 +356,7 @@ func (m *libraryModel) loadLibraryItems() []list.Item {
 		m.err = fmt.Errorf("error loading library files for list: %w", err)
 		return []list.Item{}
 	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Timestamp.After(files[j].Timestamp) })
 	items := make([]list.Item, len(files))
 	for i, file := range files {
 		items[i] = libraryListItem{file: file}

@@ -46,32 +46,35 @@ type SharedFile struct {
 	Nonce        []byte `json:"nonce"`
 }
 
-// AddFileToLibrary adds a file to the user's encrypted library.
-// It reads the file content, encrypts it, saves it, and then saves metadata.
+// AddFileToLibrary adds a file on disk to the user's encrypted library.
+// It reads the file content and hands off to AddDataToLibrary.
 func AddFileToLibrary(user *User, originalFilePath, desiredFileName, fileType string) (string, error) {
-	if user == nil || user.Username == "" {
-		return "", fmt.Errorf("invalid user for adding file to library")
-	}
-
 	fileContent, err := ioutil.ReadFile(originalFilePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read original file '%s': %w", originalFilePath, err)
 	}
+	return AddDataToLibrary(user, desiredFileName, fileType, fileContent, originalFilePath)
+}
+
+// AddDataToLibrary adds raw bytes to the user's encrypted library, encrypting the
+// content, saving it, and writing metadata. originalPath is optional provenance
+// (empty for content generated in-app, e.g. chat logs). Returns the new file ID.
+func AddDataToLibrary(user *User, desiredFileName, fileType string, content []byte, originalPath string) (string, error) {
+	if user == nil || user.Username == "" || user.EncryptionKey == nil {
+		return "", fmt.Errorf("invalid user for adding to library")
+	}
 
 	fileID := GenerateRandomID()
-	// Save the encrypted content
-	err = SaveEncryptedData(user, user.Username, "library_content", fileID, fileContent)
-	if err != nil {
+	if err := SaveEncryptedData(user, user.Username, "library_content", fileID, content); err != nil {
 		return "", fmt.Errorf("failed to save encrypted file content: %w", err)
 	}
 
-	// Create and save metadata
 	libraryFile := LibraryFile{
 		ID:           fileID,
 		Name:         desiredFileName,
 		Type:         fileType,
-		OriginalPath: originalFilePath,
-		StoredPath:   filepath.Join(GetUserDataPath(user.Username), "library_content", fileID+".bin"), // Path to the actual encrypted content
+		OriginalPath: originalPath,
+		StoredPath:   filepath.Join(GetUserDataPath(user.Username), "library_content", fileID+".bin"),
 		Timestamp:    time.Now(),
 	}
 
@@ -79,13 +82,96 @@ func AddFileToLibrary(user *User, originalFilePath, desiredFileName, fileType st
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal library file metadata: %w", err)
 	}
-
-	err = SaveEncryptedData(user, user.Username, "library_metadata", fileID, metadataBytes)
-	if err != nil {
+	if err := SaveEncryptedData(user, user.Username, "library_metadata", fileID, metadataBytes); err != nil {
 		return "", fmt.Errorf("failed to save encrypted library file metadata: %w", err)
 	}
-
 	return fileID, nil
+}
+
+// UpdateLibraryFileContent replaces the encrypted content of an existing library
+// entry in place (same ID) and bumps its timestamp. Used to keep a single library
+// snapshot of a live chat up to date across repeated /save calls.
+func UpdateLibraryFileContent(user *User, fileID string, content []byte) error {
+	if user == nil || user.Username == "" || user.EncryptionKey == nil {
+		return fmt.Errorf("invalid user for updating library file")
+	}
+	if fileID == "" {
+		return fmt.Errorf("file ID cannot be empty")
+	}
+	if err := SaveEncryptedData(user, user.Username, "library_content", fileID, content); err != nil {
+		return fmt.Errorf("failed to update library content: %w", err)
+	}
+	// Refresh the metadata timestamp so the list reflects the latest save.
+	metadataBytes, err := LoadEncryptedData(user, user.Username, "library_metadata", fileID)
+	if err != nil {
+		return nil // content updated; metadata refresh is best-effort
+	}
+	var lf LibraryFile
+	if json.Unmarshal(metadataBytes, &lf) == nil {
+		lf.Timestamp = time.Now()
+		if b, err := json.Marshal(lf); err == nil {
+			SaveEncryptedData(user, user.Username, "library_metadata", fileID, b)
+		}
+	}
+	return nil
+}
+
+// libraryExtForType returns a sensible file extension for exporting a library entry.
+func libraryExtForType(fileType string) string {
+	switch fileType {
+	case "image":
+		return ".jpg"
+	case "chat_log":
+		return ".json"
+	case "json":
+		return ".json"
+	case "character_card":
+		return ".png"
+	case "text":
+		return ".txt"
+	default:
+		return ".bin"
+	}
+}
+
+// ExportLibraryFile decrypts a library entry and writes it as a plain file into
+// destDir, returning the written path. Used by the "export" action so a saved
+// conversation or image can leave the encrypted store as a normal file.
+func ExportLibraryFile(user *User, fileID, destDir string) (string, error) {
+	file, content, err := LoadFileFromLibrary(user, fileID)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create export dir: %w", err)
+	}
+
+	base := strings.TrimSpace(file.Name)
+	if base == "" {
+		base = "library-" + fileID
+	}
+	// Slugify the name and ensure it carries the right extension.
+	base = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + 32
+		default:
+			return '-'
+		}
+	}, strings.ReplaceAll(base, " ", "-"))
+	base = strings.Trim(base, "-")
+	ext := libraryExtForType(file.Type)
+	if !strings.HasSuffix(strings.ToLower(base), ext) {
+		base += ext
+	}
+
+	outPath := filepath.Join(destDir, base)
+	if err := os.WriteFile(outPath, content, 0644); err != nil {
+		return "", fmt.Errorf("failed to write export '%s': %w", outPath, err)
+	}
+	return outPath, nil
 }
 
 // EncryptAndMarshalSharedFile encrypts file content with a sharing password and marshals it into a sharable JSON.

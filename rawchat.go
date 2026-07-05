@@ -123,11 +123,60 @@ func (c *rawCardChat) Run() error {
 	// retained (the most recent that fit are shown).
 	var strip []string // image file paths, oldest→newest
 
+	// Library wiring: conversations and images are saved into the encrypted
+	// Library (del/share/export available there). libChatID holds this session's
+	// single conversation entry so repeated saves update in place instead of
+	// piling up duplicates.
+	libChatID := ""
+	canLibrary := c.user != nil && c.user.EncryptionKey != nil
+	// saveConvToLibrary snapshots the current conversation into the Library.
+	saveConvToLibrary := func() error {
+		if !canLibrary || len(messages) == 0 {
+			return nil
+		}
+		data, err := json.MarshalIndent(messages, "", "  ")
+		if err != nil {
+			return err
+		}
+		if libChatID == "" {
+			name := fmt.Sprintf("Chat · %s · %s", cardName, time.Now().Format("2006-01-02 15:04"))
+			id, err := AddDataToLibrary(c.user, name, "chat_log", data, "")
+			if err != nil {
+				return err
+			}
+			libChatID = id
+			return nil
+		}
+		return UpdateLibraryFileContent(c.user, libChatID, data)
+	}
+	// addImageToLibrary files a generated/shared image into the Library.
+	addImageToLibrary := func(imgPath, prompt string) {
+		if !canLibrary || imgPath == "" {
+			return
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(prompt, "🎬 "))
+		if len(name) > 60 {
+			name = name[:60]
+		}
+		if name == "" {
+			name = "Image · " + cardName
+		}
+		AddFileToLibrary(c.user, imgPath, name, "image")
+	}
+
 	// Scene-image auto-illustration: every 3 character rounds the AI paints the
 	// current scene beside the avatar. Toggle with /autoimage.
 	roundCount := 0
 	autoImage := true
 	isMock := provider == ProviderMock || provider == ""
+
+	// Ensure every conversation with at least one exchange lands in the Library,
+	// no matter how the chat is left (/exit, esc, ctrl+c). Best-effort.
+	defer func() {
+		if roundCount > 0 {
+			saveConvToLibrary()
+		}
+	}()
 
 	// Layout, recomputed on resize.
 	var cols, rows, avH, avW, convTop, convBottom, barRow, inputRow int
@@ -498,8 +547,10 @@ func (c *rawCardChat) Run() error {
 		case "save":
 			if err := SaveChatSession(c.user, memID, messages); err != nil {
 				pushSys("Save failed: " + err.Error())
+			} else if err := saveConvToLibrary(); err != nil {
+				pushSys("💾 Session saved (Library snapshot failed: " + err.Error() + ")")
 			} else {
-				pushSys("💾 Conversation saved.")
+				pushSys("💾 Conversation saved — also in your Library (del/share/export there).")
 			}
 		case "export":
 			dir := filepath.Join(Paths.DataDir, "exports")
@@ -669,7 +720,8 @@ func (c *rawCardChat) Run() error {
 			case "image":
 				busy = false
 				strip = append(strip, ev.imgPath)
-				pushSys("🖼  Image → " + ev.imgPath + "  (added to the top row)")
+				addImageToLibrary(ev.imgPath, ev.imgPrompt)
+				pushSys("🖼  Image saved to your Library (del/share/export there) — added to the top row.")
 				userScrolled = false
 				// Full clean redraw so the sixel strip renders reliably.
 				fullDraw()
