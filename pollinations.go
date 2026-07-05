@@ -78,6 +78,54 @@ func (s *PollinationsLLMService) GenerateResponse(ctx context.Context, prompt st
 	return out.Choices[0].Message.Content, nil
 }
 
+// GenerateResponseWithImages sends a multimodal message (text + images) to a
+// vision-capable Pollinations model. Satisfies VisionLLMService. If no images are
+// given it behaves like GenerateResponse.
+func (s *PollinationsLLMService) GenerateResponseWithImages(ctx context.Context, prompt string, images []ImageAttachment, model LLMModel, config APIConfig) (string, error) {
+	if len(images) == 0 {
+		return s.GenerateResponse(ctx, prompt, model, config)
+	}
+	mdl := string(model)
+	if mdl == "" || mdl == "mock-model" {
+		mdl = s.model
+	}
+
+	parts := []contentPart{{Type: "text", Text: prompt}}
+	for _, img := range images {
+		parts = append(parts, contentPart{Type: "image_url", ImageURL: &imageURLRef{URL: dataURI(img)}})
+	}
+	body, _ := json.Marshal(openAIRequest{
+		Model:    mdl,
+		Messages: []openAIMessage{{Role: "user", Content: parts}},
+		Stream:   false,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", pollinationsTextURL, bytes.NewBuffer(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if s.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("pollinations vision: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("pollinations vision error %d: %s", resp.StatusCode, string(raw))
+	}
+	var out openAIResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("decode: %w", err)
+	}
+	if len(out.Choices) == 0 {
+		return "", fmt.Errorf("pollinations: empty response")
+	}
+	return out.Choices[0].Message.Content, nil
+}
+
 func (s *PollinationsLLMService) GetAvailableModels(ctx context.Context) ([]LLMModel, error) {
 	return []LLMModel{
 		"openai", "openai-fast", "openai-large", "gpt-5.4", "gpt-5.4-mini",

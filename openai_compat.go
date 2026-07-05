@@ -47,9 +47,25 @@ type openAIRequest struct {
 	Temperature float64       `json:"temperature,omitempty"`
 }
 
+// openAIMessage carries either a plain-text prompt (Content is a string) or, for
+// vision requests, an array of content parts (text + image_url). Content is an
+// interface so the same struct serves both; existing callers pass a string and
+// are unaffected.
 type openAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"`
+}
+
+// contentPart is one element of a vision message's content array, per the
+// OpenAI chat-completions multimodal format.
+type contentPart struct {
+	Type     string       `json:"type"`               // "text" | "image_url"
+	Text     string       `json:"text,omitempty"`
+	ImageURL *imageURLRef `json:"image_url,omitempty"`
+}
+
+type imageURLRef struct {
+	URL string `json:"url"` // data URI: data:<media>;base64,<...>
 }
 
 type openAIResponse struct {

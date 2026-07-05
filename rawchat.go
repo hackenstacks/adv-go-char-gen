@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,6 +52,52 @@ type chatEvent struct {
 // spinnerFrames animates the "typing…" indicator.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// sharedAttachment is a Library file the user has shared into the conversation.
+// Text-like docs inject their text into the prompt; images are sent to the model
+// as real pixels when it supports vision, otherwise referenced by name/caption.
+type sharedAttachment struct {
+	name  string
+	ftype string // library type: text | json | chat_log | image | …
+	text  string // populated for text-like docs
+	image *ImageAttachment
+}
+
+// looksTextual heuristically decides whether raw bytes are safe to inject as text
+// (valid-ish UTF-8, few control bytes) — used for docs whose type is unknown.
+func looksTextual(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	n := len(b)
+	if n > 512 {
+		n = 512
+	}
+	ctrl := 0
+	for _, c := range b[:n] {
+		if c == 0 {
+			return false
+		}
+		if c < 9 || (c > 13 && c < 32) {
+			ctrl++
+		}
+	}
+	return ctrl*20 < n // <5% control bytes
+}
+
+// imageMediaType guesses a media type from a filename/library name.
+func imageMediaType(name string) string {
+	switch {
+	case strings.HasSuffix(strings.ToLower(name), ".png"):
+		return "image/png"
+	case strings.HasSuffix(strings.ToLower(name), ".webp"):
+		return "image/webp"
+	case strings.HasSuffix(strings.ToLower(name), ".gif"):
+		return "image/gif"
+	default:
+		return "image/jpeg"
+	}
+}
+
 func (c *rawCardChat) Run() error {
 	out := c.stdout
 	if out == nil {
@@ -75,6 +123,11 @@ func (c *rawCardChat) Run() error {
 	if imgModel == "" {
 		imgModel = "flux"
 	}
+
+	// Can this provider+model actually see shared images? If not, images are
+	// referenced by title/caption in the prompt instead.
+	_, hasVision := llmSvc.(VisionLLMService)
+	visionCapable := hasVision && modelSupportsVision(model)
 
 	card, err := cc.LoadFromPNG(c.cardPath)
 	if err != nil || card == nil {
@@ -129,6 +182,11 @@ func (c *rawCardChat) Run() error {
 	// piling up duplicates.
 	libChatID := ""
 	canLibrary := c.user != nil && c.user.EncryptionKey != nil
+
+	// Files the user has shared into this conversation from the Library, plus the
+	// numbered listing shown by /files so /share <n> can resolve a pick.
+	var shared []sharedAttachment
+	var libPick []LibraryFile
 	// saveConvToLibrary snapshots the current conversation into the Library.
 	saveConvToLibrary := func() error {
 		if !canLibrary || len(messages) == 0 {
@@ -373,7 +431,27 @@ func (c *rawCardChat) Run() error {
 		b.WriteString(cardName)
 		b.WriteString(". Stay in character. Respond only as ")
 		b.WriteString(cardName)
-		b.WriteString(".\n\n--- Conversation ---\n")
+		b.WriteString(".\n\n")
+		// Inject any Library files the user shared into this conversation.
+		if len(shared) > 0 {
+			b.WriteString("--- Shared materials (provided by " + c.user.Username + ") ---\n")
+			for _, sh := range shared {
+				switch {
+				case sh.text != "":
+					txt := sh.text
+					if len(txt) > 4000 {
+						txt = txt[:4000] + "\n…(truncated)"
+					}
+					b.WriteString(fmt.Sprintf("Document %q:\n%s\n\n", sh.name, txt))
+				case sh.image != nil && visionCapable:
+					b.WriteString(fmt.Sprintf("[Image %q is attached to this message — look at it directly.]\n", sh.name))
+				case sh.image != nil:
+					b.WriteString(fmt.Sprintf("[The user shared an image titled %q. You cannot see it directly; use the title as its caption.]\n", sh.name))
+				}
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("--- Conversation ---\n")
 		start := 0
 		if len(messages) > 16 {
 			start = len(messages) - 16
@@ -394,10 +472,29 @@ func (c *rawCardChat) Run() error {
 	// sendToLLM fires the reply request in the background.
 	sendToLLM := func() {
 		prompt := buildPrompt()
+		// Gather shared images for a vision-capable model (snapshot for the goroutine).
+		var imgs []ImageAttachment
+		if visionCapable {
+			for _, sh := range shared {
+				if sh.image != nil {
+					imgs = append(imgs, *sh.image)
+				}
+			}
+		}
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
-			resp, err := llmSvc.GenerateResponse(ctx, prompt, LLMModel(model), apiCfg)
+			var resp string
+			var err error
+			if len(imgs) > 0 {
+				if vsvc, ok := llmSvc.(VisionLLMService); ok {
+					resp, err = vsvc.GenerateResponseWithImages(ctx, prompt, imgs, LLMModel(model), apiCfg)
+				} else {
+					resp, err = llmSvc.GenerateResponse(ctx, prompt, LLMModel(model), apiCfg)
+				}
+			} else {
+				resp, err = llmSvc.GenerateResponse(ctx, prompt, LLMModel(model), apiCfg)
+			}
 			if err != nil {
 				events <- chatEvent{kind: "error", msg: Message{Content: err.Error()}}
 				return
@@ -506,8 +603,11 @@ func (c *rawCardChat) Run() error {
 			return true
 		case "help":
 			pushSys("Commands: /image <prompt> (blank = illustrate current scene) · /autoimage on|off · " +
+				"/files · /share <n> · /shared · /unshare [all|n] · " +
 				"/memory · /commit <fact> · /compact · /prompt <text> · /save · /export · /models · /exit\n" +
-				"Shortcuts: ^G image  ^O memory  ^K compact  ^E export  ^S save  ^X exit  ·  ↑/↓ or PgUp/PgDn scroll\n" +
+				"Shortcuts: ^G image  ^F files  ^O memory  ^K compact  ^E export  ^S save  ^X exit  ·  ↑/↓ or PgUp/PgDn scroll\n" +
+				"Share Library files with the character: /files to list, /share <n> to give one. Docs inject text; " +
+				"images are seen directly on vision models (openai/gemini/claude) or referenced by caption otherwise. " +
 				"The character auto-illustrates the scene every 3 rounds (toggle /autoimage).")
 		case "prompt":
 			if strings.TrimSpace(args) == "" {
@@ -544,6 +644,107 @@ func (c *rawCardChat) Run() error {
 				}
 				pushSys(b.String())
 			}
+		case "files", "library", "lib":
+			if !canLibrary {
+				pushSys("Library unavailable (not logged in).")
+				break
+			}
+			files, ferr := ListLibraryFiles(c.user)
+			if ferr != nil {
+				pushSys("Library error: " + ferr.Error())
+				break
+			}
+			if len(files) == 0 {
+				pushSys("Your Library is empty. Generate images or /save a chat first.")
+				break
+			}
+			sort.Slice(files, func(i, j int) bool { return files[i].Timestamp.After(files[j].Timestamp) })
+			libPick = files
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("📚 Library (%d) — /share <n> to give one to %s:", len(files), cardName))
+			for i, f := range files {
+				if i >= 20 {
+					b.WriteString("\n  …")
+					break
+				}
+				b.WriteString(fmt.Sprintf("\n  %d. [%s] %s", i+1, f.Type, f.Name))
+			}
+			pushSys(b.String())
+		case "share":
+			if !canLibrary {
+				pushSys("Library unavailable (not logged in).")
+				break
+			}
+			idxStr := strings.TrimSpace(args)
+			if idxStr == "" {
+				pushSys("Usage: /share <n> — run /files first, then share Library file n with " + cardName + ".")
+				break
+			}
+			n, perr := strconv.Atoi(idxStr)
+			if perr != nil || n < 1 || n > len(libPick) {
+				pushSys(fmt.Sprintf("Pick a number from /files (1–%d).", len(libPick)))
+				break
+			}
+			lf := libPick[n-1]
+			_, content, lerr := LoadFileFromLibrary(c.user, lf.ID)
+			if lerr != nil {
+				pushSys("Load failed: " + lerr.Error())
+				break
+			}
+			att := sharedAttachment{name: lf.Name, ftype: lf.Type}
+			isImage := lf.Type == "image" ||
+				(len(content) > 3 && ((content[0] == 0xFF && content[1] == 0xD8) || (content[0] == 0x89 && content[1] == 'P')))
+			switch {
+			case isImage:
+				att.image = &ImageAttachment{Data: content, MediaType: imageMediaType(lf.Name)}
+				shared = append(shared, att)
+				if visionCapable {
+					pushSys(fmt.Sprintf("🖼  Shared image %q — %s can see it (vision model %s).", lf.Name, cardName, model))
+				} else {
+					pushSys(fmt.Sprintf("🖼  Shared image %q — this model can't see images, so %s receives it as a caption. Set a vision model (openai/gemini/claude) in .env for true sight.", lf.Name, cardName))
+				}
+			case lf.Type == "text" || lf.Type == "json" || lf.Type == "chat_log" || looksTextual(content):
+				att.text = string(content)
+				shared = append(shared, att)
+				pushSys(fmt.Sprintf("📄 Shared document %q (%d chars) — its text is now in %s's context.", lf.Name, len(att.text), cardName))
+			default:
+				shared = append(shared, att) // referenced by name only
+				pushSys(fmt.Sprintf("📎 Shared %q by name (binary %s can't be inlined).", lf.Name, lf.Type))
+			}
+		case "shared":
+			if len(shared) == 0 {
+				pushSys("No files shared yet. Use /files then /share <n>.")
+				break
+			}
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("📎 Shared with %s (%d):", cardName, len(shared)))
+			for i, sh := range shared {
+				kind := sh.ftype
+				if sh.image != nil {
+					if visionCapable {
+						kind = "image→vision"
+					} else {
+						kind = "image→caption"
+					}
+				}
+				b.WriteString(fmt.Sprintf("\n  %d. [%s] %s", i+1, kind, sh.name))
+			}
+			pushSys(b.String())
+		case "unshare":
+			a := strings.TrimSpace(args)
+			if a == "" || a == "all" {
+				shared = nil
+				pushSys("Cleared all shared files.")
+				break
+			}
+			n, perr := strconv.Atoi(a)
+			if perr != nil || n < 1 || n > len(shared) {
+				pushSys("Usage: /unshare [all|<n>]")
+				break
+			}
+			name := shared[n-1].name
+			shared = append(shared[:n-1], shared[n:]...)
+			pushSys("Removed shared file: " + name)
 		case "save":
 			if err := SaveChatSession(c.user, memID, messages); err != nil {
 				pushSys("Save failed: " + err.Error())
@@ -626,7 +827,7 @@ func (c *rawCardChat) Run() error {
 				pushSys("🎬 Auto scene-images ON — the character illustrates the scene every 3 rounds.")
 			}
 		default:
-			pushSys("Unknown command /" + cmd + " — try /help. (Full library features live in the main chat.)")
+			pushSys("Unknown command /" + cmd + " — try /help.")
 	}
 		return false
 	}
@@ -781,6 +982,10 @@ func (c *rawCardChat) Run() error {
 				redrawInput()
 			case b0 == 7: // Ctrl+G → prefill /image
 				input = "/image "
+				redrawInput()
+			case b0 == 6: // Ctrl+F → list Library files to share
+				handleCommand("files", "")
+				redrawConv()
 				redrawInput()
 			case b0 == 15: // Ctrl+O → /memory
 				handleCommand("memory", "")

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,39 @@ type LLMService interface {
 	Provider() Provider
 }
 
+
+// ImageAttachment is a single image handed to a vision-capable model.
+type ImageAttachment struct {
+	Data      []byte // raw image bytes
+	MediaType string // e.g. "image/jpeg", "image/png"
+}
+
+// VisionLLMService is an OPTIONAL capability: providers that can accept images
+// implement it. Callers type-assert for it and fall back to text if absent.
+type VisionLLMService interface {
+	GenerateResponseWithImages(ctx context.Context, prompt string, images []ImageAttachment, model LLMModel, config APIConfig) (string, error)
+}
+
+// modelSupportsVision reports whether a model name is known to accept images.
+// Conservative allow-list of the Pollinations vision-capable families.
+func modelSupportsVision(model string) bool {
+	m := strings.ToLower(model)
+	for _, v := range []string{"openai", "gpt", "gemini", "claude", "grok", "llava", "qwen", "mistral"} {
+		if strings.Contains(m, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// dataURI builds a base64 data URI for an image attachment.
+func dataURI(a ImageAttachment) string {
+	mt := a.MediaType
+	if mt == "" {
+		mt = "image/jpeg"
+	}
+	return "data:" + mt + ";base64," + base64.StdEncoding.EncodeToString(a.Data)
+}
 
 // ImageService defines the interface for interacting with Image Generation Models.
 type ImageService interface {

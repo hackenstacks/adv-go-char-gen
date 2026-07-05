@@ -108,14 +108,22 @@ the image never flickers. Generated images build a **filmstrip** across the top 
 | `/image <prompt>` | Generate an image beside the avatar |
 | `/image` | *(no prompt)* The character illustrates the **current scene** from the last 3 messages |
 | `/autoimage on\|off` | Toggle auto scene-illustration every 3 rounds (on by default) |
+| `/files` | List your Library files (newest first) to share with the character |
+| `/share <n>` | Share Library file *n* into the conversation — docs inject their text; images are **seen** by vision models (openai/gemini/claude) or referenced by caption otherwise |
+| `/shared` · `/unshare [all\|n]` | Show / remove shared files |
 | `/memory` · `/commit <fact>` | View / add to this character's memory |
 | `/compact` | Summarize the conversation to save context |
 | `/prompt <text>` | Steer the character's upcoming replies |
 | `/save` · `/export` | Save the session (→ Library) · export conversation as JSON |
 | `/models` · `/help` · `/exit` | List models · help · leave |
 
-**Reply-bar shortcuts:** `^G` /image · `^O` /memory · `^K` /compact · `^E` /export · `^S` /save ·
-`^X` exit · `↑/↓` `PgUp/PgDn` scroll.
+**Reply-bar shortcuts:** `^G` /image · `^F` /files · `^O` /memory · `^K` /compact · `^E` /export ·
+`^S` /save · `^X` exit · `↑/↓` `PgUp/PgDn` scroll.
+
+**Sharing files with a character:** anything in your Library — a saved conversation, a generated image,
+an imported document — can be handed to the character mid-chat. Text documents are injected into its
+context; images are **actually seen** when the model supports vision (Pollinations `openai`/`gemini`/
+`claude`…), and gracefully fall back to a captioned reference on text-only models.
 
 ---
 
