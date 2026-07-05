@@ -191,11 +191,8 @@ pixel blob, so images get clipped or misplaced. The fix that makes this whole ap
 | `data_store.go` · `auth.go` | AES-256-GCM store + account/key derivation |
 
 Card I/O and rendering come from the companion package
-[**nexus-charcard**](https://github.com/hackenstacks/nexus-charcard).
-
-> **Building from source note:** local development pins `nexus-charcard` via a `replace` directive to a
-> working copy. To build outside that setup, remove the `replace` line in `go.mod` so the published module
-> resolves, then `go mod tidy`.
+[**nexus-charcard**](https://github.com/hackenstacks/nexus-charcard) (`v0.1.0`), pulled automatically by
+`go build` — no manual setup, just clone and build.
 
 ---
 

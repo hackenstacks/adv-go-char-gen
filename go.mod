@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/google/uuid v1.6.0
-	github.com/hackenstacks/nexus-charcard v0.0.0-20260703004530-e27ba43910ed
+	github.com/hackenstacks/nexus-charcard v0.1.0
 	golang.org/x/crypto v0.46.0
 	golang.org/x/term v0.38.0
 )
@@ -36,5 +36,3 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 )
-
-replace github.com/hackenstacks/nexus-charcard => /home/user/git/nexus-charcard
