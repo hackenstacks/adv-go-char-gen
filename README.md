@@ -10,6 +10,7 @@
 [![TUI](https://img.shields.io/badge/TUI-Bubble%20Tea-ff69b4)](https://github.com/charmbracelet/bubbletea)
 [![Graphics](https://img.shields.io/badge/graphics-true--color%20sixel-7c3aed)](https://en.wikipedia.org/wiki/Sixel)
 [![Encrypted](https://img.shields.io/badge/library-AES--256--GCM-00ff88)](#-the-library)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Part of NeXuS](https://img.shields.io/badge/stack-NeXuS-DAA520)](#-the-nexus-stack)
 
 **Author: [hackenstacks](https://github.com/hackenstacks)** · [hackenstacks@gmail.com](mailto:hackenstacks@gmail.com)
@@ -218,6 +219,19 @@ adv-go-char-gen is one node in **NeXuS** — a sovereign, privacy-first toolset 
 
 Issues and PRs welcome. Keep it sane and simple, back up before you change, and never commit secrets or
 binaries.
+
+---
+
+## 📜 License
+
+Licensed under the **GNU Affero General Public License v3.0** — see [`LICENSE`](LICENSE).
+
+> The AGPL's copyleft extends to network use: if you run a modified version of this software as a service
+> that users interact with over a network, you must offer them the corresponding source. Freedom for
+> everyone in the shared space — the NeXuS golden rule.
+
+© 2026 hackenstacks. This program is free software: you can redistribute it and/or modify it under the
+terms of the AGPLv3, and it comes with **no warranty**, to the extent permitted by law.
 
 ---
 
